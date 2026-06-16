@@ -417,3 +417,51 @@ Before merging, verify:
 - [vLLM Hardware Plugin RFC](https://github.com/vllm-project/vllm/issues/11162)
 - [Documentation](https://docs.vllm.ai/projects/ascend/en/latest/)
 - [Contributors Guide](https://docs.vllm.ai/projects/ascend/en/latest/community/contributors.html)
+
+---
+
+## Cursor Cloud specific instructions
+
+This repo is a **hardware plugin for Ascend NPU**. The Cursor Cloud VM is **x86 CPU
+only with no Ascend NPU** (`npu-smi` is absent, and `torch-npu`/CANN/`triton-ascend`
+cannot run here). Two development workflows are fully supported off-NPU, and mirror
+what CI runs on its CPU runners; the live server (`vllm serve` on Ascend) cannot run here.
+
+### What works without NPU
+
+- **Lint** — `pre-commit` (all hooks) + `mypy`. This is the CI `lint-and-select-tests`
+  job (`.github/workflows/pr_test.yaml`).
+- **CPU unit tests** — everything under `tests/ut/` except the NPU-only subdirs
+  (`a2/`, `a2_2/`, `a3_2/`, `a3_4/`, `310p/`). `tests/ut/conftest.py` mocks
+  `torch_npu`/`acl`/`triton.runtime`/`mooncake` when `npu-smi` is missing, so CPU UTs
+  run on plain CPU torch. Routing conventions are in `tests/ut/conftest.py` and
+  `.github/workflows/scripts/test_config.yaml`.
+
+### Environment notes (set up during snapshot; update script refreshes pip deps)
+
+- Python is system `python3.12`. Pip user installs land in `~/.local/bin`, which is
+  added to `PATH` via `~/.bashrc`. `pre-commit`, `mypy`, `pytest`, `ruff` live there.
+- `pre-commit` shell hooks need two binaries the base image lacks: a `python`
+  command (symlink: `ln -sf /usr/bin/python3 ~/.local/bin/python`) and `shellcheck`
+  on `PATH`. `tools/shellcheck.sh` does a global `find` for `*.sh`, so **do not leave a
+  cloned vLLM source tree (e.g. `vllm-empty/`) inside the repo** — it makes the
+  shellcheck/long-functions hooks scan foreign scripts and fail. vLLM is installed as a
+  pip package, so its source tree is not needed in the workspace.
+- `vllm` is installed from the pinned commit in `.github/workflows/pr_test.yaml`
+  (currently `9090368b650896bf5fc990c921df7eb4c20355a5`) built with
+  `VLLM_TARGET_DEVICE=empty`. `vllm_ascend` is installed editable with
+  `COMPILE_CUSTOM_KERNELS=0 SOC_VERSION=ascend910b1` and `--no-deps --no-build-isolation`
+  (the full `requirements*.txt` pins NPU-only wheels from the Huawei index that do not
+  install on x86; they are mocked for CPU UTs). To rebuild vLLM if needed:
+  `git clone https://github.com/vllm-project/vllm && (cd vllm && git checkout <pinned> && VLLM_TARGET_DEVICE=empty pip install --extra-index-url https://download.pytorch.org/whl/cpu .)`
+  then re-run the editable install of this repo.
+
+### Running things
+
+- Lint (matches CI): `SHELLCHECK_OPTS="--exclude=SC2046,SC2006,SC2086" pre-commit run --all-files --hook-stage manual`
+- CPU unit tests: set `TORCH_DEVICE_BACKEND_AUTOLOAD=0` and `--ignore` the NPU subdirs
+  listed above, e.g.
+  `TORCH_DEVICE_BACKEND_AUTOLOAD=0 pytest -q $(for d in $(find tests/ut -type d \( -name a2 -o -name a2_2 -o -name a3_2 -o -name a3_4 -o -name 310p \)); do echo --ignore=$d; done) tests/ut`
+- `mypy` runs (`tools/mypy.sh 1 3.12`) but reports numpy-2.x typing-strictness errors
+  that do **not** appear in CI's pinned `:lint` image; treat those as an
+  environment-version artifact, not a code defect, unless you intentionally changed types.
