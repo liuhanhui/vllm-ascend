@@ -417,3 +417,59 @@ Before merging, verify:
 - [vLLM Hardware Plugin RFC](https://github.com/vllm-project/vllm/issues/11162)
 - [Documentation](https://docs.vllm.ai/projects/ascend/en/latest/)
 - [Contributors Guide](https://docs.vllm.ai/projects/ascend/en/latest/community/contributors.html)
+
+---
+
+## Cursor Cloud specific instructions
+
+The Cursor Cloud VM is **x86_64 CPU-only with no Ascend NPU and no CANN toolkit**. The
+actual product — running inference via `vllm serve` / `LLM` — **cannot run here**
+because the `ascend` platform requires `torch_npu` + CANN and there is no GPU/CPU
+inference fallback. What *is* fully runnable in this environment:
+
+- **CPU unit tests** under `tests/ut/` (top-level module dirs). These mock the NPU:
+  `tests/ut/conftest.py` installs `MagicMock` stand-ins for `torch_npu`, `acl`,
+  `triton.runtime`, and `mooncake.engine` whenever `npu-smi` is absent (always true
+  here). NPU subdirs (`a2/`, `a2_2/`, `a3_2/`, `a3_4/`, `310p/`) require real hardware
+  and must be excluded on CPU.
+- **Lint/format** via `ruff` (configured in `pyproject.toml`).
+
+### Environment layout (pre-installed in the VM snapshot)
+
+- Python packages are installed **system-wide** (`/usr/local/lib/python3.12/dist-packages`),
+  so plain `python3`, `pytest`, `ruff`, `vllm` work without activating a venv. Ownership
+  of `/usr/local` was given to `ubuntu`, so `uv pip install --system` / `pip install`
+  work without `sudo`.
+- CPU `torch==2.10.0` (`+cpu` build), not the NPU build.
+- Upstream **vLLM** is cloned at the CI-pinned commit at `/home/ubuntu/vllm-empty` and
+  installed editable with `VLLM_TARGET_DEVICE=empty` (CUDA `triton` uninstalled).
+- `vllm-ascend` is installed **editable** with `COMPILE_CUSTOM_KERNELS=0`
+  (`SOC_VERSION=ascend910b1`); native Ascend kernels are **not** built.
+- Intentionally **NOT installed** (Ascend-only / unavailable on x86, and not needed for
+  CPU UTs): `torch-npu`, `triton-ascend`, `arctic-inference`, `memfabric_hybrid`,
+  `memcache_hybrid`, `mindstudio-probe`, `xlite`, `uc-manager`. Do not add these to the
+  CPU setup — `tests/ut/conftest.py` already mocks the runtime ones.
+
+### Running things
+
+- Run the CPU unit suite:
+  ```bash
+  TORCH_DEVICE_BACKEND_AUTOLOAD=0 VLLM_LOGGING_LEVEL=ERROR python3 -m pytest tests/ut \
+    --ignore-glob='*/a2/*' --ignore-glob='*/a2_2/*' --ignore-glob='*/a3_2/*' \
+    --ignore-glob='*/a3_4/*' --ignore-glob='*/310p/*'
+  ```
+- Lint: `ruff check vllm_ascend/` and `ruff format --check vllm_ascend/`. The full
+  `bash format.sh ci` additionally needs pre-commit hook environments plus
+  `markdownlint`, `shellcheck`, `actionlint`, and `mypy` across py3.10–3.12; those are
+  heavier and not part of the minimal CPU setup.
+
+### Gotchas
+
+- Do **not** `import vllm_ascend.platform` (or anything that transitively imports it)
+  outside the UT harness on CPU — it does `import torch_npu` at module load and raises
+  `ModuleNotFoundError`. The unit tests avoid this via the conftest mocks. The plugin
+  *registration* hooks still work: `vllm_ascend.register()` returns
+  `"vllm_ascend.platform.NPUPlatform"` and the `vllm.platform_plugins` /
+  `vllm.general_plugins` entry points resolve fine.
+- `vllm-ascend` is editable, so `.py` edits are picked up without reinstalling; only
+  re-run the editable install if entry points / build metadata change.
