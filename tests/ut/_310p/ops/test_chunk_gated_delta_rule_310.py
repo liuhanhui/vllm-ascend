@@ -145,3 +145,15 @@ def test_chunk_gated_delta_rule_310_varlen_tnd_path():
     assert final_state_tnd is not None
     assert final_state_bthd is not None
     torch.testing.assert_close(final_state_tnd, final_state_bthd, rtol=1e-4, atol=1e-4)
+
+
+def test_can_use_npu_compute_wy_false_on_cpu():
+    torch.manual_seed(0)
+    from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import _can_use_npu_compute_wy
+
+    q = torch.randn(1, 64, 8, 64, dtype=torch.float16)
+    k = torch.randn(1, 64, 8, 64, dtype=torch.float16)
+    v = torch.randn(1, 64, 16, 64, dtype=torch.float16)
+    g = -torch.rand(1, 64, 16, dtype=torch.float32)
+    beta = torch.rand(1, 64, 16, dtype=torch.float16)
+    assert _can_use_npu_compute_wy(q, k, v, g, beta, 64) is False

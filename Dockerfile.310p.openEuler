@@ -63,6 +63,12 @@ ARG TORCH_NPU_VERSION
 ARG TORCH_NPU_DATE
 # DAILY_DEPS_MODE (optional): Daily deps install mode: 'full' or 'torch_npu_only'.
 ARG DAILY_DEPS_MODE="torch_npu_only"
+# INSTALL_OPS_TRANSFORMER_EXPERIMENTAL (optional): Overlay CANN experimental
+# ops-transformer for 310P (ChunkGatedDeltaRuleComputeWy). Set to 0 to skip.
+ARG INSTALL_OPS_TRANSFORMER_EXPERIMENTAL="1"
+# OPS_TRANSFORMER_EXPERIMENTAL_BASE_URL (optional): Directory that contains
+# cann-ops-transformer_experimental_310p_linux-<arch>.run
+ARG OPS_TRANSFORMER_EXPERIMENTAL_BASE_URL="https://test-cann.oss-cn-shanghai.aliyuncs.com/CANN/temp_ops-transformer"
 
 WORKDIR /workspace
 
@@ -74,6 +80,29 @@ RUN if [ -n "$YUM_MIRROR" ]; then \
         yum install -y python3-pip git vim wget protobuf protobuf-devel protobuf-compiler curl net-tools gcc gcc-c++ make cmake numactl numactl-devel jemalloc patch && \
     if [ -n "$YUM_MIRROR" ]; then rm -rf /etc/yum.repos.d && mv /etc/yum.repos.d.bak /etc/yum.repos.d; fi && \
     rm -rf /var/cache/yum
+
+# Overlay experimental ops-transformer (310P GDN compute_wy). Skip with
+# --build-arg INSTALL_OPS_TRANSFORMER_EXPERIMENTAL=0
+ARG TARGETPLATFORM
+ARG INSTALL_OPS_TRANSFORMER_EXPERIMENTAL
+ARG OPS_TRANSFORMER_EXPERIMENTAL_BASE_URL
+RUN if [ "${INSTALL_OPS_TRANSFORMER_EXPERIMENTAL}" = "1" ]; then \
+        ARCH=${TARGETPLATFORM:-$(uname -m)}; \
+        case "$ARCH" in \
+            "linux/arm64"|"aarch64") FILE_ARCH="aarch64" ;; \
+            "linux/amd64"|"x86_64") FILE_ARCH="x86_64" ;; \
+            *) echo "Skipping ops-transformer overlay for unsupported arch: $ARCH" && exit 0 ;; \
+        esac && \
+        PKG="cann-ops-transformer_experimental_310p_linux-${FILE_ARCH}.run" && \
+        URL="${OPS_TRANSFORMER_EXPERIMENTAL_BASE_URL}/${PKG}" && \
+        echo "Installing experimental ops-transformer from ${URL}" && \
+        wget --quiet --retry-connrefused --tries=5 --timeout=30 -O /tmp/${PKG} "${URL}" && \
+        chmod +x /tmp/${PKG} && \
+        /tmp/${PKG} --quiet --install-for-all --force && \
+        rm -f /tmp/${PKG}; \
+    else \
+        echo "Skipping experimental ops-transformer overlay"; \
+    fi
 
 # Install modelscope (for fast download) and ray (for multinode)
 RUN pip config set global.index-url ${PIP_INDEX_URL} && \
