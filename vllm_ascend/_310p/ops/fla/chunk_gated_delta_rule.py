@@ -17,6 +17,10 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+from importlib import import_module
+from typing import Callable
+
 import torch
 import torch.nn.functional as F
 
@@ -185,6 +189,95 @@ def _torch_chunk_gated_delta_rule_chunked(
 
 def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
+
+
+@lru_cache(maxsize=1)
+def _get_compute_wy_op() -> Callable | None:
+    """Resolve ChunkGatedDeltaRuleComputeWy without importing vllm_ascend.ops.
+
+    Prefer the CANN experimental overlay (`cann_ops_transformer`). Fall back to
+    a vllm-ascend custom op if it was compiled into `_C_ascend`.
+    """
+    try:
+        import_module("cann_ops_transformer")
+        namespace = getattr(torch.ops, "cann_ops_transformer", None)
+        op = getattr(namespace, "chunk_gated_delta_rule_compute_wy", None) if namespace is not None else None
+        if op is not None:
+            return op
+    except (ImportError, AttributeError):
+        pass
+
+    from vllm_ascend.utils import enable_custom_op
+
+    if not enable_custom_op():
+        return None
+    ascend_ops = getattr(torch.ops, "_C_ascend", None)
+    if ascend_ops is None or not hasattr(ascend_ops, "chunk_gated_delta_rule_compute_wy"):
+        return None
+    return ascend_ops.chunk_gated_delta_rule_compute_wy
+
+
+def _can_use_npu_compute_wy(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int,
+) -> bool:
+    """Return True when the experimental/custom WY kernel can legally run."""
+    if _get_compute_wy_op() is None:
+        return False
+    if (
+        q.device.type != "npu"
+        or k.device != q.device
+        or v.device != q.device
+        or g.device != q.device
+        or beta.device != q.device
+    ):
+        return False
+    if chunk_size != CHUNK_SIZE:
+        return False
+    if q.dtype != torch.float16 or k.dtype != torch.float16 or v.dtype != torch.float16 or beta.dtype != torch.float16:
+        return False
+    if g.dtype != torch.float32:
+        return False
+    if q.ndim != 4 or k.shape != q.shape or v.ndim != 4 or g.ndim != 3 or beta.shape != g.shape:
+        return False
+    if q.shape[1] % chunk_size != 0 or v.shape[0] != q.shape[0] or v.shape[1] != q.shape[1]:
+        return False
+    if g.shape != (q.shape[0], q.shape[1], v.shape[2]):
+        return False
+    # Host tiling constraints from ops-transformer ChunkGatedDeltaRuleComputeWy.
+    if q.shape[3] % 16 != 0 or v.shape[3] % 16 != 0:
+        return False
+    if q.shape[3] > 128 or v.shape[3] > 128:
+        return False
+    if q.shape[0] > 32 or v.shape[2] > 64:
+        return False
+    return v.shape[2] % q.shape[2] == 0
+
+
+def _compute_kernel_inputs_from_npu_wy(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not _can_use_npu_compute_wy(q, k, v, g, beta, chunk_size):
+        return _compute_kernel_inputs_from_torch_wy(q, k, v, g, beta, chunk_size)
+    compute_wy = _get_compute_wy_op()
+    assert compute_wy is not None
+    return compute_wy(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        g.contiguous(),
+        beta.contiguous(),
+        chunk_size,
+    )
 
 
 def _require_ascend_chunk_ops(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
@@ -482,9 +575,10 @@ def chunk_gated_delta_rule_310(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """310P chunk GDN path backed by AscendC fwd_h/fwd_o kernels.
 
-    Triton is unavailable on 310P, so the local WY preparation is done with
-    torch ops and the inter-chunk state/output matmuls are delegated to the
-    custom AscendC kernels.
+    Triton is unavailable on 310P. WY prefix uses CANN experimental
+    `chunk_gated_delta_rule_compute_wy` when the overlay is installed and the
+    shape is legal; otherwise it falls back to torch. Inter-chunk state and
+    output matmuls stay on the custom AscendC kernels.
     """
     if head_first:
         raise DeprecationWarning("head_first=True is not supported in 310P chunk path.")
@@ -532,7 +626,7 @@ def chunk_gated_delta_rule_310(
         return empty_out, final_state
 
     scale = k.shape[-1] ** -0.5 if scale is None else scale
-    q_kernel, k_kernel, w_kernel, u_kernel, g_kernel = _compute_kernel_inputs_from_torch_wy(
+    q_kernel, k_kernel, w_kernel, u_kernel, g_kernel = _compute_kernel_inputs_from_npu_wy(
         q_pad, k_pad, v_pad, g_pad, beta_pad, CHUNK_SIZE
     )
 
